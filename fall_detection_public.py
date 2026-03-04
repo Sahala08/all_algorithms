@@ -2,6 +2,11 @@ import os
 import numpy as np
 import pandas as pd
 from scipy.signal import butter, filtfilt
+import matplotlib.pyplot as plt
+
+# 设置中文显示（解决Matplotlib中文乱码）
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
 
 # ==========================================
 # 1. 参数配置
@@ -49,7 +54,17 @@ def detect_fall_logic(df):
     # 1. 5Hz低通滤波，去除类似D11瘫坐产生的瞬间高频震荡
     acc_filtered = butter_lowpass_filter(acc_raw, cutoff=5, fs=FS)
     svm = np.sqrt(np.sum(np.square(acc_filtered), axis=1))
-    
+
+    # # 计算采样点数
+    # sample_count = int(1.0 * FS)
+    # acc_before = acc_filtered[:sample_count, :]
+    # svm_before = svm[:sample_count]
+
+    # # 计算与垂直轴 (Y) 的夹角
+    # cos_theta = np.abs(avg_acc[1]) / avg_svm
+    # angle = np.degrees(np.arccos(np.clip(cos_theta, 0, 1)))
+
+
     max_impact = np.max(svm)
     impact_idx = np.argmax(svm)
     
@@ -70,6 +85,7 @@ def detect_fall_logic(df):
     # 计算与垂直轴(Y)的夹角
     cos_theta = np.abs(avg_acc[1]) / avg_svm
     angle = np.degrees(np.arccos(np.clip(cos_theta, 0, 1)))
+    print(f"姿态: {angle:.1f}°")
     
     # 最终逻辑：强撞击 + 身体倾斜超过阈值
     if angle > ANGLE_THRESHOLD:
@@ -77,8 +93,92 @@ def detect_fall_logic(df):
     else:
         return False, max_impact, angle
 
+
 # ==========================================
-# 3. 批量检测主程序
+# 3. 单文件检测与绘图函数
+# ==========================================
+def run_single_file_test_with_plot(file_path):
+    """
+    对单个文件进行摔倒检测，并绘制SVM滤波前后对比图，标注撞击时刻
+    """
+    if not os.path.exists(file_path):
+        print(f"找不到文件: {file_path}")
+        return
+
+    df = load_sisfall_file(file_path)
+    if df is None: return
+
+    file_name = os.path.basename(file_path)
+    acc_raw = df[['acc1_x', 'acc1_y', 'acc1_z']].values
+    
+    # --- 1. 计算原始 SVM ---
+    svm_raw = np.sqrt(np.sum(np.square(acc_raw), axis=1))
+    
+    # --- 2. 低通滤波并计算滤波后 SVM ---
+    acc_filtered = butter_lowpass_filter(acc_raw, cutoff=5, fs=FS)
+    svm_filtered = np.sqrt(np.sum(np.square(acc_filtered), axis=1))
+    
+    # --- 3. 运行检测逻辑 ---
+    max_impact = np.max(svm_filtered)
+    impact_idx = np.argmax(svm_filtered)
+    
+    is_detected = False
+    angle = 0.0
+    status_msg = "未触发阈值"
+    
+    # 检测逻辑判断
+    if max_impact >= G_THRESHOLD:
+        wait_f = int(0.5 * FS)
+        obs_f = int(1.0 * FS)
+        
+        if impact_idx + wait_f + obs_f <= len(df):
+            # 姿态计算
+            avg_acc = np.mean(acc_filtered[impact_idx + wait_f : impact_idx + wait_f + obs_f, :], axis=0)
+            avg_svm = np.sqrt(np.sum(np.square(avg_acc)))
+            cos_theta = np.abs(avg_acc[1]) / avg_svm
+            angle = np.degrees(np.arccos(np.clip(cos_theta, 0, 1)))
+            print(f"姿态: {angle:.1f}°")
+            
+            if angle > ANGLE_THRESHOLD:
+                is_detected = True
+                status_msg = f"检测到摔倒 (强度:{max_impact:.2f}g, 角度:{angle:.1f}°)"
+            else:
+                status_msg = f"误报过滤 (强度:{max_impact:.2f}g, 角度:{angle:.1f}°)"
+        else:
+            status_msg = "撞击太靠后，无法判定姿态"
+
+    # --- 4. 绘图 ---
+    plt.figure(figsize=(12, 6))
+    
+    # 绘制原始数据（浅色）
+    plt.plot(svm_raw, color='lightgray', alpha=0.7, label='原始数据 (SVM Raw)')
+    
+    # 绘制滤波后数据（深色）
+    plt.plot(svm_filtered, color='blue', linewidth=1.5, label='5Hz低通滤波后 (SVM Filtered)')
+    
+    # 标注撞击时刻
+    if max_impact >= G_THRESHOLD:
+        plt.axvline(x=impact_idx, color='red', linestyle='--', label='检测到撞击点')
+        # 标注姿态观察窗口
+        plt.axvspan(impact_idx + 100, impact_idx + 300, color='green', alpha=0.2, label='1s姿态观察期')
+        # 在图上写文字
+        plt.text(impact_idx, max_impact + 0.2, f'撞击点: {max_impact:.2f}g', color='red', weight='bold')
+
+    # 设置图表
+    actual_label = "摔倒" if file_name.startswith('F') else "日常"
+    plt.title(f"文件分析: {file_name} (真值: {actual_label}) \n结论: {status_msg}")
+    plt.xlabel("帧数 (Frame) | 采样率: 200Hz")
+    plt.ylabel("合加速度 SVM (g)")
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3)
+    
+    # 自动保存或显示
+    plt.tight_layout()
+    plt.show()
+
+
+# ==========================================
+# 4. 批量检测主程序
 # ==========================================
 def run_batch_evaluation():
     stats = {
@@ -125,9 +225,6 @@ def run_batch_evaluation():
             else:
                 stats['TN'] += 1
 
-    # ==========================================
-    # 4. 统计报表
-    # ==========================================
     total = sum(stats.values())
     accuracy = (stats['TP'] + stats['TN']) / total * 100
     sensitivity = stats['TP'] / (stats['TP'] + stats['FN']) * 100 if (stats['TP'] + stats['FN']) > 0 else 0
@@ -143,4 +240,8 @@ def run_batch_evaluation():
     print(f"详细详情: TP={stats['TP']}, TN={stats['TN']}, FP={stats['FP']}, FN={stats['FN']}")
 
 if __name__ == "__main__":
-    run_batch_evaluation()
+    # 单文件摔倒检测测试
+    run_single_file_test_with_plot(".\\data\\SisFall_dataset\\SA01\\F01_SA01_R01.txt")
+
+    # 批量摔倒检测
+    # run_batch_evaluation()
